@@ -131,3 +131,7 @@ findable).
 - Moving files to OneDrive is deliberately **not** automated — the script lists
   the largest files per profile and prints instructions, but the user decides
   what moves.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
