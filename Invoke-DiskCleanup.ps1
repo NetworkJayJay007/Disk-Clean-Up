@@ -16,16 +16,19 @@
     Report mode shows:
       - Current C: capacity / used / free
       - Machine-wide recoverable space (Windows temp, Windows Update cache,
+        Outlook diagnostic logging under <SystemDrive>\Temp for all users,
         hiberfil.sys, Windows.old)
       - Per targeted profile: Recycle Bin and temp sizes, large/old files in
         Downloads (old installers and archives are the usual culprits), and
         the largest files in the profile (candidates to move to OneDrive)
 
     Clean mode (-Clean) empties the targeted Recycle Bin(s) and clears the
-    targeted temp folder(s), Windows temp, Windows Update download cache, and
-    Delivery Optimization cache. Old, large Downloads files are only touched
-    when -IncludeDownloads is also supplied, and each file is confirmed
-    individually unless -Force is used.
+    targeted temp folder(s), Windows temp, the Windows Update download cache,
+    the Delivery Optimization cache, and Outlook diagnostic logging folders
+    ('<SystemDrive>\Temp\<any user>\Outlook Logging') for ALL users -
+    independent of -TargetUser/-AllUsers. Old, large Downloads files are only
+    touched when -IncludeDownloads is also supplied, and each file is
+    confirmed individually unless -Force is used.
 
     With -Clean -MoveToOneDrive, large old user files are MOVED into the
     profile's OneDrive folder (under 'Moved from <computer>', keeping their
@@ -329,6 +332,30 @@ function Test-NoLinkComponents {
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $item.LinkType) { return $false }
     }
     return $true
+}
+
+# Finds Outlook diagnostic-logging folders under <SystemDrive>\Temp for EVERY
+# user. Outlook's troubleshooting logging writes large .etl/.log files to
+# '<temp>\Outlook Logging'; on machines where TEMP is redirected to
+# C:\Temp\<username>, those folders grow unbounded and sit outside the
+# per-profile temp cleanup, so they are handled machine-wide instead.
+# Junctions are never looked through.
+function Get-OutlookLoggingPaths {
+    $paths = @()
+    $tempRoot = Join-Path $env:SystemDrive 'Temp'
+    if (Test-Path -LiteralPath $tempRoot) {
+        $direct = Join-Path $tempRoot 'Outlook Logging'
+        if (Test-Path -LiteralPath $direct) { $paths += $direct }
+        $children = @(Get-ChildItem -LiteralPath $tempRoot -Directory -Force -ErrorAction SilentlyContinue)
+        foreach ($child in $children) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $child.LinkType) { continue }
+            $candidate = Join-Path $child.FullName 'Outlook Logging'
+            if (Test-Path -LiteralPath $candidate) { $paths += $candidate }
+        }
+    }
+    # Emit elements plainly; callers collect with @(...) so 0/1/n results all
+    # become a flat array (a leading-comma wrap here would nest it instead).
+    return @($paths | Where-Object { Test-NoLinkComponents -Path $_ })
 }
 
 # OneDrive Files On-Demand placeholders report their full logical size but
@@ -826,6 +853,19 @@ if ($isAdmin) {
     Write-Log '  Windows Update cache:     n/a (needs elevation)'
 }
 
+# Outlook diagnostic logging under <SystemDrive>\Temp - all users' folders,
+# independent of which profiles this run targets.
+$outlookLogPaths = @(Get-OutlookLoggingPaths)
+if ($outlookLogPaths.Count -gt 0) {
+    $outlookLogBytes = [double]0
+    foreach ($olPath in $outlookLogPaths) { $outlookLogBytes += Get-FolderSizeBytes -Path $olPath }
+    Write-Log ("  Outlook logging folders:  {0} across {1} folder(s) under {2}\Temp  (all users)" -f `
+        (Format-Size $outlookLogBytes), $outlookLogPaths.Count, $env:SystemDrive)
+    if (-not $isAdmin) {
+        Write-Log '    (sizes may be incomplete and other users'' folders may not clean without elevation)' ([ConsoleColor]::DarkGray)
+    }
+}
+
 try {
     if (Test-Path -LiteralPath $hiberFile) {
         $hiberSize = (Get-Item -LiteralPath $hiberFile -Force -ErrorAction Stop).Length
@@ -1260,6 +1300,19 @@ if ($Clean) {
 
     # --- machine-wide cleanup ---
     Write-Section 'Cleaning machine-wide'
+
+    # Outlook diagnostic logging folders under <SystemDrive>\Temp - every
+    # user's, regardless of profile targeting. Runs unelevated too: files the
+    # current account cannot delete are simply skipped.
+    foreach ($olPath in $outlookLogPaths) {
+        # Re-check right before acting: a component could have been swapped
+        # for a junction since the report scan.
+        if (-not (Test-NoLinkComponents -Path $olPath)) {
+            Write-Log ("  SKIP Outlook logging [{0}] - path now passes through a junction/symlink." -f $olPath) ([ConsoleColor]::Yellow)
+            continue
+        }
+        $totalFreed += Clear-FolderContents -Path $olPath -Label ("Outlook logging [{0}]" -f $olPath)
+    }
 
     if ($isAdmin) {
         $totalFreed += Clear-FolderContents -Path $winTemp -Label 'Windows temp' -MustBeTempFolder

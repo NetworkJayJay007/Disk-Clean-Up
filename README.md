@@ -68,6 +68,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\Invoke-DiskCleanup.ps1
 | Recycle Bin | shows size per targeted profile | empties per profile: shell API for the current user, `C:\$Recycle.Bin\<SID>` contents for others |
 | Profile temp (`AppData\Local\Temp`, plus the profile's own `TEMP` setting if repointed) | shows size per profile | deletes files older than 24 h (checked per file, at every depth) |
 | Windows temp | shows size *(admin)* | same age rule *(admin)* |
+| Outlook logging (`C:\Temp\<any user>\Outlook Logging`) | shows total size across all users | deletes files older than 24 h for **all** users, regardless of `-TargetUser`/`-AllUsers` |
 | Windows Update cache | shows size *(admin)* | clears `SoftwareDistribution\Download` when over 100 MB, only if wuauserv/BITS stop cleanly *(admin)* |
 | Delivery Optimization cache | — | clears *(admin)* |
 | Downloads | per profile: lists files over 500 MB, flags ones older than 90 days | deletes flagged files only with `-IncludeDownloads`, confirmed per file unless `-Force` |
