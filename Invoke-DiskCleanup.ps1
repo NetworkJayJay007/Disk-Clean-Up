@@ -27,6 +27,20 @@
     when -IncludeDownloads is also supplied, and each file is confirmed
     individually unless -Force is used.
 
+    With -Clean -MoveToOneDrive, large old user files are MOVED into the
+    profile's OneDrive folder (under 'Moved from <computer>', keeping their
+    relative path) and marked "free up space" so OneDrive dehydrates them
+    after upload. Only plain user content from the standard folders (Desktop,
+    Documents, Pictures, Videos, Music, Downloads) is eligible; Outlook data
+    files, disk images, hidden/system files, and - critically - files inside
+    ANY cloud sync root (every OneDrive account and every SharePoint/Teams-
+    synced library, enumerated from the profile's own hive) are never moved,
+    since moving a file out of a sync root replicates as a cloud-side delete.
+    Moves therefore require the target user to be signed in (hive loaded);
+    when -IncludeDownloads is also given, Downloads deletion takes precedence
+    over moving. NOTE: disk space is freed only after OneDrive finishes
+    uploading and dehydrating the files - not at move time.
+
     Everything the script deletes is either regenerable by Windows (temp/caches)
     or explicitly confirmed by the operator (Downloads, Recycle Bin). Directory
     junctions and symbolic links are never followed: only the link itself is
@@ -63,6 +77,21 @@
     Minimum age (days since last write) for a Downloads file to be eligible.
     Default 90.
 
+.PARAMETER MoveToOneDrive
+    With -Clean, move eligible large old user files into the profile's
+    OneDrive folder and mark them "free up space" (dehydrated after upload).
+    Prompts per file unless -Force is given. Requires OneDrive to be set up
+    AND the target user to be signed in, so all sync roots can be verified
+    from their hive; skipped with a note otherwise. Business OneDrive is
+    preferred over personal when both exist.
+
+.PARAMETER MoveMinSizeMB
+    Minimum file size (MB) to be eligible for -MoveToOneDrive. Default 500.
+
+.PARAMETER MoveOlderThanDays
+    Minimum age (days since last write) to be eligible for -MoveToOneDrive.
+    Default 90. Use 0 to ignore age.
+
 .PARAMETER DeepClean
     With -Clean, also run DISM component-store cleanup (slow, so it's off by
     default). Requires elevation.
@@ -72,11 +101,14 @@
     elevation. Skip this on machines where users rely on hibernate.
 
 .PARAMETER Force
-    Skip the per-file confirmation prompts for Downloads cleanup.
+    Skip the per-file confirmation prompts for Downloads cleanup and
+    OneDrive moves.
 
 .PARAMETER SkipLargeFileScan
     Skip the recursive scan of each profile for the largest-files report
-    (the scan can take several minutes per profile on a full drive).
+    (the scan can take several minutes per profile on a full drive). The
+    scan still runs when -Clean -MoveToOneDrive is used, since move
+    candidates come from it; only the top-N listing is suppressed.
 
 .PARAMETER TopFiles
     How many of the largest files to list per profile. Default 25.
@@ -98,6 +130,11 @@
     .\Invoke-DiskCleanup.ps1 -Clean -TargetUser jsmith -IncludeDownloads
     Clean that user's Recycle Bin, temp and old large Downloads files,
     confirming each Downloads file.
+
+.EXAMPLE
+    .\Invoke-DiskCleanup.ps1 -Clean -MoveToOneDrive
+    Also move large old user files (500 MB+, 90+ days) into OneDrive,
+    confirming each file; they become online-only after upload.
 
 .EXAMPLE
     .\Invoke-DiskCleanup.ps1 -Clean -AllUsers
@@ -133,6 +170,11 @@ param(
     [int]$DownloadsMinSizeMB = 500,
     [ValidateRange(1, 36500)]
     [int]$DownloadsOlderThanDays = 90,
+    [switch]$MoveToOneDrive,
+    [ValidateRange(1, 1048576)]
+    [int]$MoveMinSizeMB = 500,
+    [ValidateRange(0, 36500)]
+    [int]$MoveOlderThanDays = 90,
     [switch]$DeepClean,
     [switch]$DisableHibernation,
     [switch]$Force,
@@ -296,6 +338,46 @@ function Test-CloudOnlyFile {
     # FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (0x400000), RECALL_ON_OPEN (0x40000), Offline (0x1000)
     $mask = 0x400000 -bor 0x40000 -bor 0x1000
     return ((([int]$File.Attributes) -band $mask) -ne 0)
+}
+
+# Decides whether a file is safe to relocate into OneDrive: plain user content
+# only. Eligible files must live under one of the profile's standard content
+# folders (Desktop/Documents/Pictures/Videos/Music/Downloads) - this keeps
+# app-owned trees like .git, VirtualBox VMs, .nuget etc. out of scope - and
+# must not be inside ANY cloud sync root (a second OneDrive account or a
+# SharePoint/Teams-synced library: moving a file out of one would sync as a
+# cloud-side DELETE). Outlook data files, disk images, hidden/system files,
+# and cloud placeholders are never candidates.
+function Test-OneDriveMoveCandidate {
+    param(
+        [System.IO.FileInfo]$File,
+        [string[]]$AllowedRoots,
+        [string[]]$SyncRoots,
+        [double]$MinBytes,
+        [datetime]$Cutoff
+    )
+    if ($File.Length -lt $MinBytes) { return $false }
+    if ($File.LastWriteTime -ge $Cutoff) { return $false }
+    if ($File.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    if (Test-CloudOnlyFile -File $File) { return $false }
+    if ($File.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) { return $false }
+    $blockedExt = @('.ost', '.pst', '.vhd', '.vhdx', '.vmdk', '.avhd', '.avhdx', '.vdi', '.qcow2', '.img', '.hdd')
+    if ($blockedExt -contains $File.Extension.ToLowerInvariant()) { return $false }
+    $filePath = $File.FullName
+    $inAllowed = $false
+    foreach ($root in $AllowedRoots) {
+        if (-not $root) { continue }
+        if ($filePath.StartsWith(($root.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) {
+            $inAllowed = $true
+            break
+        }
+    }
+    if (-not $inAllowed) { return $false }
+    foreach ($root in $SyncRoots) {
+        if (-not $root) { continue }
+        if ($filePath.StartsWith(($root.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
 }
 
 # Deletes old contents of a folder (never the folder itself). The age cutoff
@@ -543,6 +625,105 @@ function Get-ProfileOneDrivePath {
     return $null
 }
 
+# Enumerates ALL of a profile's cloud sync roots (every OneDrive account's
+# UserFolder plus every SharePoint/Teams library synced under Tenants) from
+# the profile's own hive, and picks the move destination (business OneDrive
+# preferred over personal). Files must never be moved OUT of any sync root -
+# the sync engine would replicate that as a deletion in the cloud - so moves
+# are refused entirely when the hive isn't loaded and the roots can't be
+# verified (HiveReadable = false).
+function Get-ProfileOneDriveInfo {
+    param($TargetProfile)
+    $syncRoots = @()
+    $moveTarget = $null
+    $personalTarget = $null
+    $hiveReadable = $false
+    if ($TargetProfile.HiveLoaded) {
+        $hiveReadable = $true
+        $accountsKey = $null
+        try {
+            $accountsKey = Get-Item -Path "Registry::HKEY_USERS\$($TargetProfile.Sid)\Software\Microsoft\OneDrive\Accounts" -ErrorAction Stop
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            # Key absent: OneDrive simply isn't configured. Not a read failure.
+            $accountsKey = $null
+        } catch {
+            # Could not READ the key: fail closed - an incomplete sync-root
+            # list must refuse moves rather than risk moving out of one.
+            $accountsKey = $null
+            $hiveReadable = $false
+        }
+        if ($accountsKey) {
+            $acctNames = @()
+            try { $acctNames = @($accountsKey.GetSubKeyNames()) } catch { $hiveReadable = $false }
+            foreach ($acctName in $acctNames) {
+                $acct = $null
+                try { $acct = $accountsKey.OpenSubKey($acctName) } catch { }
+                if (-not $acct) { $hiveReadable = $false; continue }
+                $rawFolder = $null
+                $userFolder = $null
+                try { $rawFolder = $acct.GetValue('UserFolder', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } catch { $hiveReadable = $false }
+                if ($rawFolder) {
+                    $userFolder = Expand-TargetProfileValue -Raw $rawFolder -ProfilePath $TargetProfile.ProfilePath
+                    # A sync root we cannot resolve means the exclusion list is
+                    # incomplete - fail closed.
+                    if (-not $userFolder) { $hiveReadable = $false }
+                }
+                if ($userFolder) {
+                    $syncRoots += $userFolder
+                    # A destination candidate gets the same guards as every
+                    # other hive-derived path: local, rooted, canonicalized,
+                    # and actually present on disk.
+                    $validTarget = $null
+                    try {
+                        if ([System.IO.Path]::IsPathRooted($userFolder) -and -not $userFolder.StartsWith('\\')) {
+                            $canonical = [System.IO.Path]::GetFullPath($userFolder)
+                            if (Test-Path -LiteralPath $canonical) { $validTarget = $canonical }
+                        }
+                    } catch { }
+                    if ($validTarget) {
+                        if ($acctName -like 'Business*') {
+                            if (-not $moveTarget) { $moveTarget = $validTarget }
+                        } elseif (-not $personalTarget) {
+                            $personalTarget = $validTarget
+                        }
+                    }
+                }
+                $tenants = $null
+                try { $tenants = $acct.OpenSubKey('Tenants') } catch { $hiveReadable = $false }
+                if ($tenants) {
+                    $tenantNames = @()
+                    try { $tenantNames = @($tenants.GetSubKeyNames()) } catch { $hiveReadable = $false }
+                    foreach ($tenantName in $tenantNames) {
+                        $tenantKey = $null
+                        try { $tenantKey = $tenants.OpenSubKey($tenantName) } catch { }
+                        if (-not $tenantKey) { $hiveReadable = $false; continue }
+                        # Value NAMES under a tenant key are the local paths
+                        # of synced SharePoint/Teams libraries.
+                        $libNames = @()
+                        try { $libNames = @($tenantKey.GetValueNames()) } catch { $hiveReadable = $false }
+                        foreach ($libPath in $libNames) {
+                            if ($libPath) { $syncRoots += $libPath }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (-not $moveTarget) { $moveTarget = $personalTarget }
+    # Belt and braces: also treat env-derived and OneDrive*-named folders as
+    # sync roots even if the Accounts key missed them.
+    $envRoot = Get-ProfileOneDrivePath -TargetProfile $TargetProfile
+    if ($envRoot) { $syncRoots += $envRoot }
+    $namedRoots = @(Get-ChildItem -LiteralPath $TargetProfile.ProfilePath -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'OneDrive*' })
+    foreach ($nr in $namedRoots) { $syncRoots += $nr.FullName }
+    New-Object PSObject -Property @{
+        MoveTarget   = $moveTarget
+        SyncRoots    = @($syncRoots | Where-Object { $_ } | Select-Object -Unique)
+        HiveReadable = $hiveReadable
+    }
+}
+
 # ------------------------------------------------------------------ setup ---
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -589,6 +770,7 @@ if (-not $isAdmin) {
 if (-not $Clean) {
     foreach ($ignored in @(
         @{ On = [bool]$IncludeDownloads;   Name = '-IncludeDownloads' },
+        @{ On = [bool]$MoveToOneDrive;     Name = '-MoveToOneDrive' },
         @{ On = [bool]$DeepClean;          Name = '-DeepClean' },
         @{ On = [bool]$DisableHibernation; Name = '-DisableHibernation' },
         @{ On = [bool]$Force;              Name = '-Force' }
@@ -778,18 +960,57 @@ foreach ($prof in $targetProfiles) {
         Write-Log ("  Downloads folder not found ({0})." -f $profDownloads) ([ConsoleColor]::Yellow)
     }
 
-    # Largest files in the profile - candidates to move to OneDrive.
-    if (-not $SkipLargeFileScan) {
-        Write-Log ("  Largest {0} files (OneDrive move candidates) - scanning, this can take a few minutes..." -f $TopFiles) ([ConsoleColor]::DarkGray)
+    # Largest files in the profile - candidates to move to OneDrive. The
+    # inventory is also needed when -Clean -MoveToOneDrive is requested even
+    # if the listing itself was skipped.
+    $odInfo = Get-ProfileOneDriveInfo -TargetProfile $prof
+    $profileInv = $null
+    $moveCandidates = @()
+    $moveAllowedRoots = @()
+    if ((-not $SkipLargeFileScan) -or ($Clean -and $MoveToOneDrive -and $odInfo.HiveReadable -and $odInfo.MoveTarget)) {
+        if ($SkipLargeFileScan) {
+            Write-Log '  Scanning profile for OneDrive move candidates - this can take a few minutes...' ([ConsoleColor]::DarkGray)
+        } else {
+            Write-Log ("  Largest {0} files (OneDrive move candidates) - scanning, this can take a few minutes..." -f $TopFiles) ([ConsoleColor]::DarkGray)
+        }
         $profileInv = Get-FolderInventory -Root $prof.ProfilePath
+    }
+    if ($profileInv -and $odInfo.MoveTarget -and $odInfo.HiveReadable) {
+        # Only plain user-content folders are in scope for moves.
+        foreach ($contentFolder in @('Desktop', 'Documents', 'Pictures', 'Videos', 'Music')) {
+            $moveAllowedRoots += (Join-Path $prof.ProfilePath $contentFolder)
+        }
+        $moveAllowedRoots += $profDownloads
+        # A file that -IncludeDownloads will delete is not also a move
+        # candidate: deletion takes precedence when both switches are used.
+        $dlExclude = @{}
+        if ($IncludeDownloads) {
+            foreach ($dc in $candidates) { $dlExclude[$dc.FullName] = $true }
+        }
+        $moveCutoff = (Get-Date).AddDays(-$MoveOlderThanDays)
+        $moveCandidates = @($profileInv.Files | Where-Object {
+            (-not $dlExclude.ContainsKey($_.FullName)) -and
+            (Test-OneDriveMoveCandidate -File $_ -AllowedRoots $moveAllowedRoots -SyncRoots $odInfo.SyncRoots -MinBytes ($MoveMinSizeMB * 1MB) -Cutoff $moveCutoff)
+        })
+    }
+    if ($profileInv -and -not $SkipLargeFileScan) {
+        $movePathSet = @{}
+        foreach ($mc in $moveCandidates) { $movePathSet[$mc.FullName] = $true }
         $largest = $profileInv.Files |
             Where-Object { -not (Test-CloudOnlyFile -File $_) } |
             Sort-Object Length -Descending |
             Select-Object -First $TopFiles
         foreach ($f in $largest) {
-            Write-Log ("    {0,10}  {1:yyyy-MM-dd}  {2}" -f (Format-Size $f.Length), $f.LastWriteTime, $f.FullName)
+            $tag = ''
+            if ($movePathSet.ContainsKey($f.FullName)) { $tag = '  (eligible for -MoveToOneDrive)' }
+            Write-Log ("    {0,10}  {1:yyyy-MM-dd}  {2}{3}" -f (Format-Size $f.Length), $f.LastWriteTime, $f.FullName, $tag)
         }
         Write-Log '    Cloud-only OneDrive placeholders excluded; .ost/.pst and AppData files usually should NOT be moved or deleted.' ([ConsoleColor]::DarkGray)
+    }
+    if ($moveCandidates.Count -gt 0) {
+        $moveBytes = ($moveCandidates | Measure-Object -Property Length -Sum).Sum
+        Write-Log ("  OneDrive move candidates: {0} file(s), {1} (moved only with -Clean -MoveToOneDrive; space frees after upload)." -f `
+            $moveCandidates.Count, (Format-Size $moveBytes)) ([ConsoleColor]::White)
     }
 
     if ($profOneDrive) {
@@ -804,6 +1025,9 @@ foreach ($prof in $targetProfiles) {
         BinPath            = $profBin
         DownloadsPath      = $profDownloads
         DownloadCandidates = $candidates
+        MoveCandidates     = $moveCandidates
+        MoveAllowedRoots   = $moveAllowedRoots
+        OneDriveInfo       = $odInfo
         OneDrivePath       = $profOneDrive
     }
 }
@@ -811,13 +1035,17 @@ foreach ($prof in $targetProfiles) {
 # ------------------------------------------------------------------ clean ---
 
 $totalFreed = [double]0
+$totalMoved = [double]0
 
 if ($Clean) {
 
-    # Downloads confirmation state spans ALL profiles: 'Yes to All' / 'No to
-    # All' mean the whole run, exactly as the prompt presents them.
+    # Confirmation state spans ALL profiles: 'Yes to All' / 'No to All' mean
+    # the whole run, exactly as the prompts present them. Downloads deletion
+    # and OneDrive moves keep separate answers.
     $yesToAll = [bool]$Force
     $noToAll = $false
+    $odYesToAll = [bool]$Force
+    $odNoToAll = $false
 
     # --- per-profile cleanup ---
     foreach ($pd in $profileData) {
@@ -895,6 +1123,136 @@ if ($Clean) {
                     }
                 } elseif (-not $doDelete) {
                     Write-Log ("  Kept: {0}" -f $f.Name)
+                }
+            }
+        }
+
+        # 4. Move large old user files into OneDrive - only with the explicit
+        #    switch. Space is freed after OneDrive uploads and dehydrates them.
+        if ($MoveToOneDrive) {
+            $odi = $pd.OneDriveInfo
+            $moveList = @($pd.MoveCandidates)
+            if (-not $odi.HiveReadable) {
+                Write-Log '  OneDrive move: cannot verify this profile''s sync folders (user not signed in); skipping moves for this profile.' ([ConsoleColor]::Yellow)
+            } elseif (-not $odi.MoveTarget) {
+                Write-Log '  OneDrive move: no usable OneDrive folder was found for this profile; skipping.' ([ConsoleColor]::Yellow)
+            } elseif ($moveList.Count -eq 0) {
+                Write-Log ("  OneDrive move: nothing eligible (over {0} MB, older than {1} days, in the standard user-content folders)." -f $MoveMinSizeMB, $MoveOlderThanDays)
+            } elseif (-not (Test-NoLinkComponents -Path $odi.MoveTarget)) {
+                Write-Log '  OneDrive move: the OneDrive path passes through a junction/symlink; skipping.' ([ConsoleColor]::Yellow)
+            } else {
+                # Files On-Demand disabled by policy means moved files can never
+                # dehydrate - the move would free no local space.
+                $fodDisabled = $false
+                try {
+                    $odPolicy = Get-Item -Path 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\OneDrive' -ErrorAction Stop
+                    if (($odPolicy.GetValue('FilesOnDemandEnabled', $null)) -eq 0) { $fodDisabled = $true }
+                } catch { }
+                if ($fodDisabled) {
+                    Write-Log '  NOTE: Files On-Demand is disabled by policy - moved files will stay on this disk and free no local space.' ([ConsoleColor]::Yellow)
+                }
+                if ($prof.IsCurrentUser) {
+                    if (-not (Get-Process -Name 'OneDrive' -ErrorAction SilentlyContinue)) {
+                        Write-Log '  NOTE: OneDrive is not running; moved files upload when OneDrive next starts for this profile.' ([ConsoleColor]::Yellow)
+                    }
+                } else {
+                    Write-Log '  NOTE: OneDrive upload state was not verified for this profile; files upload when OneDrive next syncs.' ([ConsoleColor]::DarkGray)
+                }
+                $archiveRoot = Join-Path $odi.MoveTarget ("Moved from {0}" -f $env:COMPUTERNAME)
+                $profRootTrim = $prof.ProfilePath.TrimEnd('\')
+                $moveCutoff = (Get-Date).AddDays(-$MoveOlderThanDays)
+                foreach ($f in $moveList) {
+                    # Re-check right before acting, same as Downloads deletion.
+                    $current = $null
+                    try { $current = Get-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch { }
+                    $stillEligible = ($current -is [System.IO.FileInfo]) -and
+                        (Test-OneDriveMoveCandidate -File $current -AllowedRoots $pd.MoveAllowedRoots -SyncRoots $odi.SyncRoots -MinBytes ($MoveMinSizeMB * 1MB) -Cutoff $moveCutoff)
+                    if (-not $stillEligible) {
+                        Write-Log ("  Skipped (missing or changed since the scan): {0}" -f $f.Name) ([ConsoleColor]::Yellow)
+                        continue
+                    }
+                    $rel = $current.FullName.Substring($profRootTrim.Length).TrimStart('\')
+                    $dest = Join-Path $archiveRoot $rel
+                    if (Test-Path -LiteralPath $dest) {
+                        # Never assume an existing destination IS this file: it
+                        # may be a partial copy from an interrupted earlier move.
+                        $existing = $null
+                        try { $existing = Get-Item -LiteralPath $dest -Force -ErrorAction Stop } catch { }
+                        if (($existing -is [System.IO.FileInfo]) -and ($existing.Length -eq $current.Length)) {
+                            Write-Log ("  Skipped (a same-size copy is already in OneDrive): {0}" -f $rel)
+                            continue
+                        }
+                        $collisionDir = Split-Path $dest -Parent
+                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($dest)
+                        $extName = [System.IO.Path]::GetExtension($dest)
+                        $alt = $null
+                        for ($n = 1; $n -le 9; $n++) {
+                            $candidatePath = Join-Path $collisionDir ("{0} ({1}){2}" -f $baseName, $n, $extName)
+                            if (-not (Test-Path -LiteralPath $candidatePath)) { $alt = $candidatePath; break }
+                        }
+                        if (-not $alt) {
+                            Write-Log ("  Skipped: {0} - OneDrive holds DIFFERENT content under this name (and all fallback names); local file left in place." -f $rel) ([ConsoleColor]::Yellow)
+                            continue
+                        }
+                        Write-Log ("  NOTE: {0} exists in OneDrive with a different size; moving as '{1}'." -f $rel, (Split-Path $alt -Leaf)) ([ConsoleColor]::Yellow)
+                        $dest = $alt
+                    }
+                    $desc = "{0}\{1} ({2}, last modified {3:yyyy-MM-dd})" -f $prof.UserName, $rel, (Format-Size $current.Length), $current.LastWriteTime
+                    $doMove = $odYesToAll
+                    if ($WhatIfPreference) {
+                        # Don't prompt during a dry run; let ShouldProcess print the What-if line.
+                        $doMove = $true
+                    } elseif (-not $odYesToAll -and -not $odNoToAll) {
+                        try {
+                            $doMove = $PSCmdlet.ShouldContinue("Move $desc to OneDrive?", 'OneDrive move', [ref]$odYesToAll, [ref]$odNoToAll)
+                        } catch {
+                            # Non-interactive host (RMM/scheduled task) cannot prompt.
+                            Write-Log '  Host cannot prompt for confirmation; moving nothing. Use -Force for unattended runs.' ([ConsoleColor]::Yellow)
+                            $doMove = $false
+                            $odNoToAll = $true
+                        }
+                    }
+                    if ($doMove -and $PSCmdlet.ShouldProcess($current.FullName, "Move to OneDrive ($dest)")) {
+                        $len = $current.Length
+                        $destDir = Split-Path $dest -Parent
+                        try {
+                            if (-not (Test-Path -LiteralPath $destDir)) {
+                                New-Item -Path $destDir -ItemType Directory -Force -Confirm:$false -ErrorAction Stop | Out-Null
+                            }
+                        } catch {
+                            Write-Log ("  Could not create destination folder for {0}: {1}" -f $rel, $_.Exception.Message) ([ConsoleColor]::Yellow)
+                            continue
+                        }
+                        # The archive path is user-writable: re-verify no
+                        # component is a junction before moving through it.
+                        if (-not (Test-NoLinkComponents -Path $destDir)) {
+                            Write-Log '  OneDrive move: the archive folder contains a junction/symlink; stopping moves for this profile.' ([ConsoleColor]::Red)
+                            break
+                        }
+                        try {
+                            # .NET Move is literal on both sides (no wildcard
+                            # semantics) and works across volumes.
+                            [System.IO.File]::Move($current.FullName, $dest)
+                        } catch {
+                            Write-Log ("  Could not move {0}: {1}" -f $rel, $_.Exception.Message) ([ConsoleColor]::Yellow)
+                            continue
+                        }
+                        $movedItem = $null
+                        try { $movedItem = Get-Item -LiteralPath $dest -Force -ErrorAction Stop } catch { }
+                        if (($movedItem -is [System.IO.FileInfo]) -and ($movedItem.Length -eq $len)) {
+                            # Mark "free up space" so OneDrive dehydrates it once uploaded.
+                            & attrib.exe +U -P "$dest" 2>&1 | Out-Null
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Log ("  NOTE: could not mark {0} as 'free up space'; right-click it in OneDrive after upload." -f $rel) ([ConsoleColor]::Yellow)
+                            }
+                            Write-Log ("  Moved to OneDrive: {0} ({1})" -f $rel, (Format-Size $len)) ([ConsoleColor]::Green)
+                            $totalMoved += $len
+                        } else {
+                            Write-Log ("  WARNING: {0} did not arrive intact at {1}; check both locations." -f $rel, $dest) ([ConsoleColor]::Red)
+                        }
+                    } elseif (-not $doMove) {
+                        Write-Log ("  Kept: {0}" -f $rel)
+                    }
                 }
             }
         }
@@ -996,6 +1354,9 @@ if ($Clean) {
         Write-Log ("  Free space before:        {0}" -f (Format-Size $freeBefore)) ([ConsoleColor]::White)
         Write-Log ("  Free space after:         {0}" -f (Format-Size $freeAfter)) ([ConsoleColor]::White)
         Write-Log ("  Freed by cleanup steps:   {0}" -f (Format-Size $totalFreed)) ([ConsoleColor]::Green)
+        if ($totalMoved -gt 0) {
+            Write-Log ("  Moved to OneDrive:        {0}  (frees space only after upload completes and files dehydrate)" -f (Format-Size $totalMoved)) ([ConsoleColor]::Green)
+        }
         # The net figure can differ from the step total (or even go negative)
         # if other processes wrote to disk during the run.
         Write-Log ("  Net free-space change:    {0}" -f (Format-Size ($freeAfter - $freeBefore))) ([ConsoleColor]::White)
@@ -1005,7 +1366,7 @@ if ($Clean) {
 }
 
 Write-Log ''
-Write-Log 'Remaining manual step: move large personal files to OneDrive.' ([ConsoleColor]::White)
+Write-Log 'Large personal files can be moved to OneDrive with -Clean -MoveToOneDrive, or manually:' ([ConsoleColor]::White)
 foreach ($pd in $profileData) {
     if ($pd.OneDrivePath) {
         Write-Log ("  {0}: move files into {1}, wait for the sync check-mark, then right-click > Free up space." -f $pd.Profile.UserName, $pd.OneDrivePath)

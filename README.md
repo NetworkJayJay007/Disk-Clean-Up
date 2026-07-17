@@ -40,6 +40,10 @@ detects both cases and suggests the right switch).
 # 4. Also remove their old, large Downloads files (asks before each file)
 .\Invoke-DiskCleanup.ps1 -Clean -TargetUser jsmith -IncludeDownloads
 
+# 4b. Move large old user files into OneDrive (asks before each file;
+#     space frees after OneDrive uploads them and they dehydrate)
+.\Invoke-DiskCleanup.ps1 -Clean -MoveToOneDrive
+
 # 5. Every profile on the machine
 .\Invoke-DiskCleanup.ps1 -Clean -AllUsers
 
@@ -67,7 +71,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\Invoke-DiskCleanup.ps1
 | Windows Update cache | shows size *(admin)* | clears `SoftwareDistribution\Download` when over 100 MB, only if wuauserv/BITS stop cleanly *(admin)* |
 | Delivery Optimization cache | — | clears *(admin)* |
 | Downloads | per profile: lists files over 500 MB, flags ones older than 90 days | deletes flagged files only with `-IncludeDownloads`, confirmed per file unless `-Force` |
-| Largest files in profile | top 25 per profile as OneDrive-move candidates (cloud-only placeholders excluded) | same (report only) |
+| Largest files in profile | top 25 per profile, flagging OneDrive-move candidates (cloud-only placeholders excluded) | moved into `<OneDrive>\Moved from <PC>\...` only with `-MoveToOneDrive`, confirmed per file unless `-Force`; marked "free up space" so they dehydrate after upload |
 | hiberfil.sys / Windows.old | reports if present | hibernation off only with `-Clean -DisableHibernation` |
 | DISM component cleanup | — | only with `-Clean -DeepClean` |
 
@@ -128,9 +132,32 @@ findable).
   "What if:" lines (their sizes appear in the report section).
 - The Windows Update cache is only cleared when both update services stop
   cleanly, and any service the script stopped is always restarted.
-- Moving files to OneDrive is deliberately **not** automated — the script lists
-  the largest files per profile and prints instructions, but the user decides
-  what moves.
+- OneDrive moves are opt-in (`-Clean -MoveToOneDrive`) and conservative: only
+  plain user content over the size/age thresholds, and only from the standard
+  folders (Desktop, Documents, Pictures, Videos, Music, Downloads) — so
+  app-owned trees like `.git`, VM folders, or package caches are never
+  touched. Outlook data files (.ost/.pst), disk images
+  (.vhd/.vhdx/.vmdk/.vdi/...), and hidden/system files are always excluded.
+- **Files inside any cloud sync root are never moved.** Every OneDrive
+  account and every SharePoint/Teams-synced library is enumerated from the
+  target user's own registry hive and excluded — moving a file out of a sync
+  root would replicate to the cloud as a *deletion*. Because this requires
+  reading the user's hive, moves only run when the target user is signed in;
+  business OneDrive is preferred over personal as the destination.
+- Files keep their relative path under `<OneDrive>\Moved from <PC>\`. A
+  same-size destination copy is skipped; a different-size collision (e.g. a
+  partial file from an interrupted move) is never masked — the file moves
+  under a ` (n)` suffix instead. Every candidate is re-checked right before
+  moving, arrival is verified by size, the archive path is re-checked for
+  junctions before each move, and each file is confirmed unless `-Force` is
+  given. When `-IncludeDownloads` is also used, Downloads deletion takes
+  precedence over moving.
+- **Moving to OneDrive does not free space immediately** — the file is marked
+  "free up space" and the disk space comes back once OneDrive finishes
+  uploading and dehydrates it. The summary reports moved bytes separately
+  from freed bytes for this reason, the script warns when the marking fails
+  or when Files On-Demand is disabled by policy (in which case moves free
+  nothing), and files upload whenever OneDrive next syncs for that profile.
 
 ## License
 
